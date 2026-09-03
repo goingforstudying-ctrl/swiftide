@@ -52,6 +52,7 @@ macro_rules! pipeline_with_new_stream {
             indexing_defaults: $pipeline.indexing_defaults.clone(),
             batch_size: $pipeline.batch_size,
             stats: $pipeline.stats.clone(),
+            node_caches: $pipeline.node_caches.clone(),
         }
     };
 }
@@ -80,10 +81,16 @@ pub struct Pipeline<T: Chunk> {
     indexing_defaults: IndexingDefaults,
     batch_size: usize,
     stats: StatsCollector,
+    node_caches: Vec<DynNodeCacheSet>,
 }
 
 type DynStorageSetupFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
+/// Marks a node id as processed in a `NodeCache`. Type erased so the cache registered in
+/// [`Pipeline::filter_cached`] survives the node type changing across pipeline stages.
+type DynNodeCacheSet =
+    Arc<dyn Fn(uuid::Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 impl<T: Chunk> Default for Pipeline<T> {
     /// Creates a default `Pipeline` with an empty stream, no storage, and a concurrency level equal
@@ -96,6 +103,7 @@ impl<T: Chunk> Default for Pipeline<T> {
             indexing_defaults: IndexingDefaults::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             stats: StatsCollector::new(),
+            node_caches: Vec::new(),
         }
     }
 }
@@ -185,6 +193,9 @@ impl<T: Chunk> Pipeline<T> {
 
     /// Filters out cached nodes using the provided cache.
     ///
+    /// Nodes are only marked in the cache once they have made it through the whole pipeline, so
+    /// a node that fails partway is retried on the next run instead of being skipped.
+    ///
     /// # Arguments
     ///
     /// * `cache` - A cache that implements the `NodeCache` trait.
@@ -195,6 +206,16 @@ impl<T: Chunk> Pipeline<T> {
     #[must_use]
     pub fn filter_cached(mut self, cache: impl NodeCache<Input = T> + 'static) -> Self {
         let cache = Arc::new(cache);
+
+        self.node_caches.push({
+            let cache = Arc::clone(&cache);
+            Arc::new(move |id: uuid::Uuid| {
+                let cache = Arc::clone(&cache);
+                Box::pin(async move { cache.set_by_id(id).await })
+                    as Pin<Box<dyn Future<Output = ()> + Send>>
+            })
+        });
+
         self.stream = self
             .stream
             .try_filter_map(move |node| {
@@ -207,7 +228,6 @@ impl<T: Chunk> Pipeline<T> {
                         Ok(None)
                     } else {
                         node_trace_log!(cache, node, "node not in cache, processing");
-                        cache.set(&node).await;
                         Ok(Some(node))
                     }
                 }
@@ -697,11 +717,24 @@ impl<T: Chunk> Pipeline<T> {
         futures_util::future::try_join_all(setup_futures).await?;
 
         let mut total_nodes = 0u64;
+        let mut cached_ids = std::collections::HashSet::new();
 
-        while let Some(_result) = self.stream.try_next().await? {
+        while let Some(node) = self.stream.try_next().await? {
             total_nodes += 1;
             // Count successful nodes as stored (nodes that reach the end of the stream)
             self.stats.increment_nodes_stored(1);
+
+            // Nodes reaching the end of the stream made it through the whole pipeline; only
+            // now mark them in the cache. Chunked nodes share the id of the node that entered
+            // the pipeline, so each is cached once.
+            if !self.node_caches.is_empty() {
+                let id = node.parent_id.unwrap_or_else(|| node.id());
+                if cached_ids.insert(id) {
+                    for mark_cached in &self.node_caches {
+                        mark_cached(id).await;
+                    }
+                }
+            }
         }
 
         self.stats.increment_nodes_processed(total_nodes);
@@ -1119,5 +1152,170 @@ mod tests {
         // Verify storage has the nodes
         let nodes = storage.get_all().await;
         assert_eq!(nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_nodes_only_cached_on_success() {
+        let mut loader = MockLoader::new();
+        let mut cache = MockNodeCache::new();
+        let mut storage = MockPersist::new();
+        let mut transformer = MockTransformer::new();
+
+        loader
+            .expect_into_stream()
+            .returning(|| vec![Ok(Node::default())].into());
+
+        cache.expect_get().times(1).returning(|_| false);
+        cache.expect_name().returning(|| "test_cache");
+
+        transformer
+            .expect_transform_node()
+            .returning(|_| Err(anyhow::anyhow!("Transformation failed")));
+        transformer.expect_concurrency().returning(|| None);
+        transformer
+            .expect_name()
+            .returning(|| "failing_transformer");
+
+        storage.expect_setup().returning(|| Ok(()));
+        storage.expect_batch_size().returning(|| None);
+
+        // The node never makes it through the pipeline, so nothing may be cached
+        cache.expect_set().times(0);
+        cache.expect_set_by_id().times(0);
+
+        let pipeline = Pipeline::from_loader(loader)
+            .filter_cached(cache)
+            .then(transformer)
+            .then_store_with(storage)
+            .filter_errors();
+
+        pipeline.run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_nodes_cached_on_successful_run() {
+        let mut loader = MockLoader::new();
+        let mut cache = MockNodeCache::new();
+        let storage = MemoryStorage::default();
+
+        loader
+            .expect_into_stream()
+            .returning(|| vec![Ok(Node::default())].into());
+
+        cache.expect_name().returning(|| "test_cache");
+        cache.expect_get().times(1).returning(|_| false);
+
+        cache.expect_set().times(0);
+        cache.expect_set_by_id().times(1).returning(|_| ());
+
+        let pipeline = Pipeline::from_loader(loader)
+            .filter_cached(cache)
+            .then_store_with(storage);
+
+        pipeline.run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cached_nodes_are_skipped() {
+        let mut loader = MockLoader::new();
+        let mut cache = MockNodeCache::new();
+        let storage = MemoryStorage::default();
+
+        loader
+            .expect_into_stream()
+            .returning(|| vec![Ok(Node::default())].into());
+
+        cache.expect_name().returning(|| "test_cache");
+        cache.expect_get().times(1).returning(|_| true);
+
+        // Already cached, so no marking either
+        cache.expect_set_by_id().times(0);
+
+        let pipeline = Pipeline::from_loader(loader)
+            .filter_cached(cache)
+            .then_store_with(storage.clone());
+
+        pipeline.run().await.unwrap();
+        assert!(storage.get_all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chunked_nodes_cache_their_parent_once() {
+        let mut loader = MockLoader::new();
+        let mut cache = MockNodeCache::new();
+        let mut chunker = MockChunkerTransformer::new();
+        let storage = MemoryStorage::default();
+
+        let parent = Node::from("parent document");
+        let parent_id = parent.id();
+
+        loader
+            .expect_into_stream()
+            .returning(move || vec![Ok(parent.clone())].into());
+
+        cache.expect_name().returning(|| "test_cache");
+        cache.expect_get().times(1).returning(|_| false);
+
+        chunker.expect_transform_node().returning(|node| {
+            vec![
+                Ok(Node::build_from_other(&node)
+                    .chunk("chunk 1".to_string())
+                    .build()
+                    .unwrap()),
+                Ok(Node::build_from_other(&node)
+                    .chunk("chunk 2".to_string())
+                    .build()
+                    .unwrap()),
+                Ok(Node::build_from_other(&node)
+                    .chunk("chunk 3".to_string())
+                    .build()
+                    .unwrap()),
+            ]
+            .into()
+        });
+        chunker.expect_concurrency().returning(|| None);
+        chunker.expect_name().returning(|| "chunker");
+
+        // Three chunks make it through, but only the shared parent id gets cached
+        cache
+            .expect_set_by_id()
+            .times(1)
+            .withf(move |id| *id == parent_id)
+            .returning(|_| ());
+
+        let pipeline = Pipeline::from_loader(loader)
+            .filter_cached(cache)
+            .then_chunk(chunker)
+            .then_store_with(storage.clone());
+
+        pipeline.run().await.unwrap();
+        assert_eq!(storage.get_all().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_caches_all_marked_on_success() {
+        let mut loader = MockLoader::new();
+        let mut first_cache = MockNodeCache::new();
+        let mut second_cache = MockNodeCache::new();
+        let storage = MemoryStorage::default();
+
+        loader
+            .expect_into_stream()
+            .returning(|| vec![Ok(Node::default())].into());
+
+        first_cache.expect_name().returning(|| "first_cache");
+        first_cache.expect_get().times(1).returning(|_| false);
+        first_cache.expect_set_by_id().times(1).returning(|_| ());
+
+        second_cache.expect_name().returning(|| "second_cache");
+        second_cache.expect_get().times(1).returning(|_| false);
+        second_cache.expect_set_by_id().times(1).returning(|_| ());
+
+        let pipeline = Pipeline::from_loader(loader)
+            .filter_cached(first_cache)
+            .filter_cached(second_cache)
+            .then_store_with(storage);
+
+        pipeline.run().await.unwrap();
     }
 }
