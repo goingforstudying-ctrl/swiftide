@@ -12,9 +12,15 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use swiftide_core::indexing::{EmbedMode, IndexingStream, Node};
+use uuid::Uuid;
 
 macro_rules! trace_span {
     ($op:literal, $step:expr) => {
@@ -53,6 +59,7 @@ macro_rules! pipeline_with_new_stream {
             batch_size: $pipeline.batch_size,
             stats: $pipeline.stats.clone(),
             node_caches: $pipeline.node_caches.clone(),
+            failed_ids: $pipeline.failed_ids.clone(),
         }
     };
 }
@@ -82,6 +89,10 @@ pub struct Pipeline<T: Chunk> {
     batch_size: usize,
     stats: StatsCollector,
     node_caches: Vec<DynNodeCacheSet>,
+    // Source ids (the id a node entered the pipeline with, kept in `parent_id`)
+    // that had a failure anywhere in their fan-out. Populated by the pipeline
+    // stages while nodes flow through them so failures survive `filter_errors`.
+    failed_ids: Arc<FailedIds>,
 }
 
 type DynStorageSetupFn =
@@ -91,6 +102,63 @@ type DynStorageSetupFn =
 /// [`Pipeline::filter_cached`] survives the node type changing across pipeline stages.
 type DynNodeCacheSet =
     Arc<dyn Fn(uuid::Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Shared registry of source ids whose processing failed. Pipelines produced
+/// by `split_by` share one registry; `merge` links independent registries so
+/// [`Pipeline::run`] sees failures recorded by either side.
+#[derive(Default)]
+struct FailedIds {
+    own: StdMutex<HashSet<Uuid>>,
+    linked: StdMutex<Vec<Arc<FailedIds>>>,
+}
+
+impl FailedIds {
+    fn record(&self, ids: &[Uuid]) {
+        self.own
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(ids.iter().copied());
+    }
+
+    /// Whether `id` was recorded in this registry or in any registry linked
+    /// into it by [`Pipeline::merge`].
+    fn contains(id: &Uuid, root: &Arc<FailedIds>) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack = vec![Arc::clone(root)];
+
+        while let Some(node) = stack.pop() {
+            let key = Arc::as_ptr(&node) as usize;
+            if !visited.insert(key) {
+                continue;
+            }
+
+            if node
+                .own
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(id)
+            {
+                return true;
+            }
+
+            let linked = node
+                .linked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            stack.extend(linked);
+        }
+
+        false
+    }
+}
+
+/// Records the source ids of nodes whose processing failed. The ids are
+/// checked by [`Pipeline::run`] when it decides which source nodes may be
+/// marked as cached.
+fn record_failed_ids(failed_ids: &Arc<FailedIds>, ids: &[Uuid]) {
+    failed_ids.record(ids);
+}
 
 impl<T: Chunk> Default for Pipeline<T> {
     /// Creates a default `Pipeline` with an empty stream, no storage, and a concurrency level equal
@@ -104,6 +172,7 @@ impl<T: Chunk> Default for Pipeline<T> {
             batch_size: DEFAULT_BATCH_SIZE,
             stats: StatsCollector::new(),
             node_caches: Vec::new(),
+            failed_ids: Arc::new(FailedIds::default()),
         }
     }
 }
@@ -259,16 +328,24 @@ impl<T: Chunk> Pipeline<T> {
         transformer.with_indexing_defaults(self.indexing_defaults.clone());
 
         let transformer = Arc::new(transformer);
+        let failed_ids = self.failed_ids.clone();
         let stream = self
             .stream
             .map_ok(move |node| {
                 let transformer = transformer.clone();
+                let failed_ids = failed_ids.clone();
                 let span = trace_span!("then", transformer);
 
                 task::spawn(
                     async move {
                         node_trace_log!(transformer, node, "Transforming node");
-                        transformer.transform_node(node).await
+
+                        let id = node.parent_id.unwrap_or_else(|| node.id());
+                        let result = transformer.transform_node(node).await;
+                        if result.is_err() {
+                            record_failed_ids(&failed_ids, &[id]);
+                        }
+                        result
                     }
                     .instrument(span.or_current()),
                 )
@@ -305,17 +382,32 @@ impl<T: Chunk> Pipeline<T> {
         transformer.with_indexing_defaults(self.indexing_defaults.clone());
 
         let transformer = Arc::new(transformer);
+        let failed_ids = self.failed_ids.clone();
         let stream = self
             .stream
             .try_chunks(transformer.batch_size().unwrap_or(self.batch_size))
             .map_ok(move |nodes| {
                 let transformer = Arc::clone(&transformer);
+                let failed_ids = failed_ids.clone();
                 let span = trace_span!("then_in_batch", transformer);
+
+                let parent_ids: Vec<Uuid> = nodes
+                    .iter()
+                    .map(|node| node.parent_id.unwrap_or_else(|| node.id()))
+                    .collect();
 
                 tokio::spawn(
                     async move {
                         batch_node_trace_log!(transformer, nodes, "batch transforming nodes");
-                        transformer.batch_transform(nodes).await
+
+                        transformer
+                            .batch_transform(nodes)
+                            .await
+                            .inspect(move |item| {
+                                if item.is_err() {
+                                    record_failed_ids(&failed_ids, &parent_ids);
+                                }
+                            })
                     }
                     .instrument(span.or_current()),
                 )
@@ -346,16 +438,24 @@ impl<T: Chunk> Pipeline<T> {
     ) -> Pipeline<Output> {
         let chunker = Arc::new(chunker);
         let concurrency = chunker.concurrency().unwrap_or(self.concurrency);
+        let failed_ids = self.failed_ids.clone();
         let stream = self
             .stream
             .map_ok(move |node| {
                 let chunker = Arc::clone(&chunker);
+                let failed_ids = failed_ids.clone();
                 let span = trace_span!("then_chunk", chunker);
 
                 tokio::spawn(
                     async move {
                         node_trace_log!(chunker, node, "Chunking node");
-                        chunker.transform_node(node).await
+
+                        let id = node.parent_id.unwrap_or_else(|| node.id());
+                        chunker.transform_node(node).await.inspect(move |item| {
+                            if item.is_err() {
+                                record_failed_ids(&failed_ids, &[id]);
+                            }
+                        })
                     }
                     .instrument(span.or_current()),
                 )
@@ -389,16 +489,24 @@ impl<T: Chunk> Pipeline<T> {
     ) -> Pipeline<Output> {
         let chunker = Arc::new(transformer);
         let concurrency = chunker.concurrency().unwrap_or(self.concurrency);
+        let failed_ids = self.failed_ids.clone();
         let stream = self
             .stream
             .map_ok(move |node| {
                 let chunker = Arc::clone(&chunker);
+                let failed_ids = failed_ids.clone();
                 let span = trace_span!("then_expand", chunker);
 
                 tokio::spawn(
                     async move {
                         node_trace_log!(chunker, node, "Expanding node");
-                        chunker.transform_node(node).await
+
+                        let id = node.parent_id.unwrap_or_else(|| node.id());
+                        chunker.transform_node(node).await.inspect(move |item| {
+                            if item.is_err() {
+                                record_failed_ids(&failed_ids, &[id]);
+                            }
+                        })
                     }
                     .instrument(span.or_current()),
                 )
@@ -451,17 +559,29 @@ impl<T: Chunk> Pipeline<T> {
         self.storage_setup_fns.push(setup_fn);
 
         // add storage to the stream instead of doing it at the end
+        let failed_ids = self.failed_ids.clone();
         let stream = if storage.batch_size().is_some() {
             self.stream
                 .try_chunks(storage.batch_size().unwrap())
                 .map_ok(move |nodes| {
                     let storage = Arc::clone(&storage);
+                    let failed_ids = failed_ids.clone();
                     let span = trace_span!("then_store_with_batched", storage);
+
+                    let parent_ids: Vec<Uuid> = nodes
+                        .iter()
+                        .map(|node| node.parent_id.unwrap_or_else(|| node.id()))
+                        .collect();
 
                     tokio::spawn(
                         async move {
                             batch_node_trace_log!(storage, nodes, "batch storing nodes");
-                            storage.batch_store(nodes).await
+
+                            storage.batch_store(nodes).await.inspect(move |item| {
+                                if item.is_err() {
+                                    record_failed_ids(&failed_ids, &parent_ids);
+                                }
+                            })
                         }
                         .instrument(span.or_current()),
                     )
@@ -475,13 +595,19 @@ impl<T: Chunk> Pipeline<T> {
             self.stream
                 .map_ok(move |node| {
                     let storage = Arc::clone(&storage);
+                    let failed_ids = failed_ids.clone();
                     let span = trace_span!("then_store_with", storage);
 
                     tokio::spawn(
                         async move {
                             node_trace_log!(storage, node, "Storing node");
 
-                            storage.store(node).await
+                            let id = node.parent_id.unwrap_or_else(|| node.id());
+                            let result = storage.store(node).await;
+                            if result.is_err() {
+                                record_failed_ids(&failed_ids, &[id]);
+                            }
+                            result
                         }
                         .instrument(span.or_current()),
                     )
@@ -562,8 +688,33 @@ impl<T: Chunk> Pipeline<T> {
     ///
     /// The full stream can then be processed using the `run` method.
     #[must_use]
-    pub fn merge(self, other: Self) -> Self {
+    pub fn merge(mut self, other: Self) -> Self {
         let stream = tokio_stream::StreamExt::merge(self.stream, other.stream);
+
+        // Combine the cache registrations of both pipelines so nodes that
+        // complete in either stream mark all caches. Pipelines produced by
+        // `split_by` share the same `Arc` allocations for registrations they
+        // inherited, so pointer equality dedupes those.
+        for cache in other.node_caches {
+            if !self
+                .node_caches
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &cache))
+            {
+                self.node_caches.push(cache);
+            }
+        }
+
+        // Link the failure registries so `run` sees failures recorded by
+        // either side. Pipelines produced by `split_by` already share one
+        // registry; skip the link in that case.
+        if !Arc::ptr_eq(&self.failed_ids, &other.failed_ids) {
+            self.failed_ids
+                .linked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(other.failed_ids);
+        }
 
         Self {
             stream: stream.boxed().into(),
@@ -717,22 +868,40 @@ impl<T: Chunk> Pipeline<T> {
         futures_util::future::try_join_all(setup_futures).await?;
 
         let mut total_nodes = 0u64;
-        let mut cached_ids = std::collections::HashSet::new();
+        let mut completed_ids = HashSet::new();
 
         while let Some(node) = self.stream.try_next().await? {
             total_nodes += 1;
             // Count successful nodes as stored (nodes that reach the end of the stream)
             self.stats.increment_nodes_stored(1);
 
-            // Nodes reaching the end of the stream made it through the whole pipeline; only
-            // now mark them in the cache. Chunked nodes share the id of the node that entered
-            // the pipeline, so each is cached once.
+            // Nodes reaching the end of the stream made it through the whole
+            // pipeline, but a source node is only marked as cached once every
+            // child it produced completed successfully. Collect the
+            // candidates now and mark them only after the stream finished
+            // without errors. Chunked nodes share the id of the node that
+            // entered the pipeline, so each is cached once.
             if !self.node_caches.is_empty() {
-                let id = node.parent_id.unwrap_or_else(|| node.id());
-                if cached_ids.insert(id) {
-                    for mark_cached in &self.node_caches {
-                        mark_cached(id).await;
-                    }
+                completed_ids.insert(node.parent_id.unwrap_or_else(|| node.id()));
+            }
+        }
+
+        // The stream completed without errors; only now mark the parents in
+        // the caches. Parents that had a failure recorded anywhere in their
+        // fan-out are skipped so their failed chunks are retried on the next
+        // run.
+        if !self.node_caches.is_empty() {
+            let to_mark: Vec<Uuid> = {
+                let failed = self.failed_ids.clone();
+                completed_ids
+                    .into_iter()
+                    .filter(|id| !FailedIds::contains(id, &failed))
+                    .collect()
+            };
+
+            for id in to_mark {
+                for mark_cached in &self.node_caches {
+                    mark_cached(id).await;
                 }
             }
         }
@@ -1317,5 +1486,155 @@ mod tests {
             .then_store_with(storage);
 
         pipeline.run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_parent_not_cached_when_chunker_fails_after_success() {
+        let mut loader = MockLoader::new();
+        let mut cache = MockNodeCache::new();
+        let mut chunker = MockChunkerTransformer::new();
+        let storage = MemoryStorage::default();
+
+        let parent = Node::from("parent document");
+
+        loader
+            .expect_into_stream()
+            .returning(move || vec![Ok(parent.clone())].into());
+
+        cache.expect_name().returning(|| "test_cache");
+        cache.expect_get().times(1).returning(|_| false);
+        // The chunker yields one child and then errors: the source must not
+        // be cached, or its failed chunks would be skipped on the next run.
+        cache.expect_set_by_id().times(0);
+
+        chunker.expect_transform_node().returning(|node| {
+            vec![
+                Ok(Node::build_from_other(&node)
+                    .chunk("chunk 1".to_string())
+                    .build()
+                    .unwrap()),
+                Err(anyhow::anyhow!("chunking failed halfway")),
+            ]
+            .into()
+        });
+        chunker.expect_concurrency().returning(|| None);
+        chunker.expect_name().returning(|| "chunker");
+
+        let pipeline = Pipeline::from_loader(loader)
+            .filter_cached(cache)
+            .then_chunk(chunker)
+            .then_store_with(storage.clone())
+            .filter_errors();
+
+        pipeline.run().await.unwrap();
+
+        // The successful child was still stored
+        assert_eq!(storage.get_all().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_merge_marks_caches_from_both_pipelines() {
+        let mut loader = MockLoader::new();
+        let mut shared_cache = MockNodeCache::new();
+        let mut left_cache = MockNodeCache::new();
+        let mut right_cache = MockNodeCache::new();
+        let storage = MemoryStorage::default();
+
+        loader
+            .expect_into_stream()
+            .returning(|| vec![Ok(Node::default())].into());
+
+        shared_cache.expect_name().returning(|| "shared_cache");
+        shared_cache.expect_get().times(1).returning(|_| false);
+        // Registered before split_by, so both halves inherit the same
+        // registration; merge must not mark it twice.
+        shared_cache.expect_set_by_id().times(1).returning(|_| ());
+
+        left_cache.expect_name().returning(|| "left_cache");
+        left_cache.expect_get().times(0);
+        left_cache.expect_set_by_id().times(1).returning(|_| ());
+
+        right_cache.expect_name().returning(|| "right_cache");
+        right_cache.expect_get().times(1).returning(|_| false);
+        right_cache.expect_set_by_id().times(1).returning(|_| ());
+
+        let pipeline = Pipeline::from_loader(loader).filter_cached(shared_cache);
+        let (left, right) = pipeline.split_by(|_| false);
+        let left = left.filter_cached(left_cache);
+        let right = right.filter_cached(right_cache);
+
+        left.merge(right)
+            .then_store_with(storage)
+            .run()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_merge_tracks_failures_from_independent_pipelines() {
+        let mut loader_left = MockLoader::new();
+        let mut loader_right = MockLoader::new();
+        let mut left_cache = MockNodeCache::new();
+        let mut right_cache = MockNodeCache::new();
+        let mut chunker = MockChunkerTransformer::new();
+        let storage = MemoryStorage::default();
+
+        let left_node = TextNode::new("left document");
+        let right_node = TextNode::new("right document");
+        let left_id = left_node.id();
+        let right_id = right_node.id();
+
+        loader_left
+            .expect_into_stream()
+            .returning(move || vec![Ok(left_node.clone())].into());
+        loader_right
+            .expect_into_stream()
+            .returning(move || vec![Ok(right_node.clone())].into());
+
+        left_cache.expect_name().returning(|| "left_cache");
+        left_cache.expect_get().times(1).returning(|_| false);
+        left_cache
+            .expect_set_by_id()
+            .times(1)
+            .withf(move |id| *id == left_id)
+            .returning(|_| ());
+
+        right_cache.expect_name().returning(|| "right_cache");
+        right_cache.expect_get().times(1).returning(|_| false);
+        // The right side fails midway, so its source must not be marked in
+        // either cache; only the left node completes.
+        right_cache
+            .expect_set_by_id()
+            .times(1)
+            .withf(move |id| *id == left_id && *id != right_id)
+            .returning(|_| ());
+
+        chunker.expect_transform_node().returning(|node| {
+            vec![
+                Ok(Node::build_from_other(&node)
+                    .chunk("chunk 1".to_string())
+                    .build()
+                    .unwrap()),
+                Err(anyhow::anyhow!("chunking failed halfway")),
+            ]
+            .into()
+        });
+        chunker.expect_concurrency().returning(|| None);
+        chunker.expect_name().returning(|| "chunker");
+
+        let left = Pipeline::from_loader(loader_left).filter_cached(left_cache);
+        let right = Pipeline::from_loader(loader_right)
+            .filter_cached(right_cache)
+            .then_chunk(chunker)
+            .filter_errors();
+
+        left.merge(right)
+            .then_store_with(storage.clone())
+            .run()
+            .await
+            .unwrap();
+
+        // The left node and the one successful right child were stored
+        assert_eq!(storage.get_all().await.len(), 2);
     }
 }
