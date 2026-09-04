@@ -60,6 +60,7 @@ macro_rules! pipeline_with_new_stream {
             stats: $pipeline.stats.clone(),
             node_caches: $pipeline.node_caches.clone(),
             failed_ids: $pipeline.failed_ids.clone(),
+            passed_cache_ids: $pipeline.passed_cache_ids.clone(),
         }
     };
 }
@@ -93,6 +94,10 @@ pub struct Pipeline<T: Chunk> {
     // that had a failure anywhere in their fan-out. Populated by the pipeline
     // stages while nodes flow through them so failures survive `filter_errors`.
     failed_ids: Arc<FailedIds>,
+    // Pairs of (cache registration pointer, source id) for nodes that passed
+    // each cache's filter. `run` marks each source only in the caches that
+    // actually processed it instead of every cache combined by `merge`.
+    passed_cache_ids: Arc<PassedCacheIds>,
 }
 
 type DynStorageSetupFn =
@@ -153,6 +158,62 @@ impl FailedIds {
     }
 }
 
+/// Shared registry of cache-filter passes, keyed by the cache registration
+/// pointer and the source id of the node that passed. Pipelines produced by
+/// `split_by` share one registry; `merge` links independent registries so
+/// [`Pipeline::run`] sees passes recorded by either side.
+///
+/// `run` marks each source id only in the caches whose filter it actually
+/// passed. Without this scoping a merged pipeline would mark every completed
+/// source in every cache, and a later run with a changed `split_by` predicate
+/// could skip a node in a branch that never processed it.
+#[derive(Default)]
+struct PassedCacheIds {
+    own: StdMutex<HashSet<(usize, Uuid)>>,
+    linked: StdMutex<Vec<Arc<PassedCacheIds>>>,
+}
+
+impl PassedCacheIds {
+    fn record(&self, cache_key: usize, id: Uuid) {
+        self.own
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((cache_key, id));
+    }
+
+    /// All `(cache registration, source id)` pairs recorded in this registry
+    /// or in any registry linked into it by [`Pipeline::merge`].
+    fn collect(root: &Arc<PassedCacheIds>) -> HashSet<(usize, Uuid)> {
+        let mut visited = HashSet::new();
+        let mut stack = vec![Arc::clone(root)];
+        let mut passes = HashSet::new();
+
+        while let Some(node) = stack.pop() {
+            let key = Arc::as_ptr(&node) as usize;
+            if !visited.insert(key) {
+                continue;
+            }
+
+            passes.extend(
+                node.own
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .copied(),
+            );
+
+            let linked = node
+                .linked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            stack.extend(linked);
+        }
+
+        passes
+    }
+}
+
 /// Records the source ids of nodes whose processing failed. The ids are
 /// checked by [`Pipeline::run`] when it decides which source nodes may be
 /// marked as cached.
@@ -173,6 +234,7 @@ impl<T: Chunk> Default for Pipeline<T> {
             stats: StatsCollector::new(),
             node_caches: Vec::new(),
             failed_ids: Arc::new(FailedIds::default()),
+            passed_cache_ids: Arc::new(PassedCacheIds::default()),
         }
     }
 }
@@ -276,19 +338,24 @@ impl<T: Chunk> Pipeline<T> {
     pub fn filter_cached(mut self, cache: impl NodeCache<Input = T> + 'static) -> Self {
         let cache = Arc::new(cache);
 
-        self.node_caches.push({
+        let mark_cached: DynNodeCacheSet = Arc::new({
             let cache = Arc::clone(&cache);
-            Arc::new(move |id: uuid::Uuid| {
+            move |id: uuid::Uuid| {
                 let cache = Arc::clone(&cache);
                 Box::pin(async move { cache.set_by_id(id).await })
                     as Pin<Box<dyn Future<Output = ()> + Send>>
-            })
+            }
         });
+        let cache_key = Arc::as_ptr(&mark_cached).cast::<()>() as usize;
+        self.node_caches.push(mark_cached);
+
+        let passed_cache_ids = Arc::clone(&self.passed_cache_ids);
 
         self.stream = self
             .stream
             .try_filter_map(move |node| {
                 let cache = Arc::clone(&cache);
+                let passed_cache_ids = Arc::clone(&passed_cache_ids);
                 let span = trace_span!("filter_cached", cache);
 
                 async move {
@@ -297,6 +364,8 @@ impl<T: Chunk> Pipeline<T> {
                         Ok(None)
                     } else {
                         node_trace_log!(cache, node, "node not in cache, processing");
+                        let id = node.parent_id.unwrap_or_else(|| node.id());
+                        passed_cache_ids.record(cache_key, id);
                         Ok(Some(node))
                     }
                 }
@@ -716,6 +785,17 @@ impl<T: Chunk> Pipeline<T> {
                 .push(other.failed_ids);
         }
 
+        // Link the cache-pass registries so `run` sees which caches processed
+        // each node. Pipelines produced by `split_by` already share one
+        // registry; skip the link in that case.
+        if !Arc::ptr_eq(&self.passed_cache_ids, &other.passed_cache_ids) {
+            self.passed_cache_ids
+                .linked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(other.passed_cache_ids);
+        }
+
         Self {
             stream: stream.boxed().into(),
             ..self
@@ -891,19 +971,37 @@ impl<T: Chunk> Pipeline<T> {
         // fan-out are skipped so their failed chunks are retried on the next
         // run.
         if !self.node_caches.is_empty() {
-            let to_mark: Vec<Uuid> = {
-                let failed = self.failed_ids.clone();
-                completed_ids
-                    .into_iter()
-                    .filter(|id| !FailedIds::contains(id, &failed))
-                    .collect()
-            };
+            // Each source id is marked only in the caches whose filter it
+            // actually passed. Marking every cache combined by `merge` would
+            // let one branch skip a node another branch processed when the
+            // `split_by` predicate changes between runs.
+            let passed = PassedCacheIds::collect(&self.passed_cache_ids);
 
-            for id in to_mark {
-                for mark_cached in &self.node_caches {
-                    mark_cached(id).await;
-                }
-            }
+            let to_mark: Vec<(DynNodeCacheSet, Uuid)> = completed_ids
+                .into_iter()
+                .filter(|id| !FailedIds::contains(id, &self.failed_ids))
+                .flat_map(|id| {
+                    let passed = &passed;
+                    self.node_caches
+                        .iter()
+                        .cloned()
+                        .filter_map(move |mark_cached| {
+                            let cache_key = Arc::as_ptr(&mark_cached).cast::<()>() as usize;
+                            passed
+                                .contains(&(cache_key, id))
+                                .then_some((mark_cached, id))
+                        })
+                })
+                .collect();
+
+            // Bound the marking work to the pipeline's concurrency so a large
+            // corpus does not issue one serial round-trip per source id.
+            futures_util::stream::iter(
+                to_mark.into_iter().map(|(mark_cached, id)| mark_cached(id)),
+            )
+            .buffer_unordered(self.concurrency)
+            .collect::<Vec<()>>()
+            .await;
         }
 
         self.stats.increment_nodes_processed(total_nodes);
@@ -1533,7 +1631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_marks_caches_from_both_pipelines() {
+    async fn test_merge_only_marks_caches_the_branch_processed() {
         let mut loader = MockLoader::new();
         let mut shared_cache = MockNodeCache::new();
         let mut left_cache = MockNodeCache::new();
@@ -1552,7 +1650,10 @@ mod tests {
 
         left_cache.expect_name().returning(|| "left_cache");
         left_cache.expect_get().times(0);
-        left_cache.expect_set_by_id().times(1).returning(|_| ());
+        // The node was routed to the right branch, so the left cache must
+        // not be marked; otherwise a later run with a changed predicate
+        // would skip the node on the left branch.
+        left_cache.expect_set_by_id().times(0);
 
         right_cache.expect_name().returning(|| "right_cache");
         right_cache.expect_get().times(1).returning(|_| false);
@@ -1582,7 +1683,6 @@ mod tests {
         let left_node = TextNode::new("left document");
         let right_node = TextNode::new("right document");
         let left_id = left_node.id();
-        let right_id = right_node.id();
 
         loader_left
             .expect_into_stream()
@@ -1601,13 +1701,10 @@ mod tests {
 
         right_cache.expect_name().returning(|| "right_cache");
         right_cache.expect_get().times(1).returning(|_| false);
-        // The right side fails midway, so its source must not be marked in
-        // either cache; only the left node completes.
-        right_cache
-            .expect_set_by_id()
-            .times(1)
-            .withf(move |id| *id == left_id && *id != right_id)
-            .returning(|_| ());
+        // The right source fails midway, so it must never be marked, and the
+        // left node never passed the right cache's filter, so the right cache
+        // gets no marks at all.
+        right_cache.expect_set_by_id().times(0);
 
         chunker.expect_transform_node().returning(|node| {
             vec![
